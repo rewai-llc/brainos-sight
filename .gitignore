@@ -1,0 +1,46 @@
+# Secrets and local config: never commit
+.env
+.env.*
+*.keystore
+*.jks
+local.properties
+google-services.json
+GoogleService-Info.plist
+*.pem
+*.key
+# Build output
+build/
+.gradle/
+.idea/
+*.apk
+*.aab
+# Captured media must never be committed
+*.wav
+*.pcm
+*.jpg
+*.jpeg
+*.png
+!docs/**/*.png
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
