@@ -18,12 +18,14 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import android.view.KeyEvent
 import androidx.core.content.ContextCompat
 import com.brainos.sight.R
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import camlink.CameraLink
 import kotlinx.coroutines.flow.update
 import java.util.concurrent.Executors
 
@@ -37,6 +39,9 @@ data class SightState(
     val photo: Bitmap? = null,
     val model: String = "",
     val importing: Int = -1, // model copy progress 0..100, -1 = not copying
+    val timing: String = "",
+    /** This phone can recognize spoken questions without going online. */
+    val speechOnDevice: Boolean = true,
 )
 
 object SightHub {
@@ -57,6 +62,14 @@ class SightSettings(context: Context) {
     var flip: Boolean
         get() = prefs.getBoolean("flip", false)
         set(v) = prefs.edit().putBoolean("flip", v).apply()
+
+    /**
+     * Only matters on phones that can't recognize speech on the device: let "Ask a question" use the
+     * system's speech service, which may send the spoken question (never the photo) online. Off by default.
+     */
+    var onlineSpeech: Boolean
+        get() = prefs.getBoolean("online_speech", false)
+        set(v) = prefs.edit().putBoolean("online_speech", v).apply()
 }
 
 /**
@@ -85,6 +98,7 @@ class SightService : Service() {
         speaker = Speaker(this).also { it.setRate(settings.rate) }
         eyes = Eyes(this)
         ears = Ears(this)
+        SightHub.state.update { it.copy(speechOnDevice = ears.onDevice) }
         refreshModelState()
     }
 
@@ -95,9 +109,11 @@ class SightService : Service() {
             ACTION_READ -> request(Request.Read)
             ACTION_DESCRIBE -> request(Request.Describe)
             ACTION_ASK -> ask()
+            ACTION_COLOR -> request(Request.Color)
             ACTION_HUSH -> hush()
             ACTION_SETTINGS -> applySettings()
             ACTION_MODEL -> refreshModelState()
+            ACTION_PROBE -> probeCamera()
         }
         return START_NOT_STICKY
     }
@@ -109,9 +125,13 @@ class SightService : Service() {
             return
         }
         wake = (getSystemService(POWER_SERVICE) as PowerManager)
-            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "brainos:sight").apply { setReferenceCounted(false); acquire() }
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "brainos:sight").apply {
+                setReferenceCounted(false)
+                acquire(WAKE_LIMIT_MS) // lapses by itself if the app ever dies without cleaning up
+            }
         camera = CameraLink(
             this,
+            tag = LOG_TAG,
             onStatus = { s -> onCameraStatus(s) },
             onButton = { main.post { onHeadsetButton() } },
         ).also { it.start() }
@@ -147,11 +167,19 @@ class SightService : Service() {
     private fun onCameraStatus(s: String) {
         val prev = SightHub.state.value.camera
         SightHub.state.update { it.copy(camera = s) }
-        if (s == "connected" && prev != "connected") {
+        // The E12 reports "connected (E12 headset)", so match the prefix, not the exact word.
+        val nowConnected = s.startsWith("connected")
+        val wasConnected = prev.startsWith("connected")
+        if (nowConnected && !wasConnected) {
             camera?.setOrientation(settings.flip, settings.flip)
             speaker.add("Camera connected.")
-        } else if (prev == "connected" && s != "connected" && SightHub.state.value.running) {
+        } else if (wasConnected && !nowConnected && SightHub.state.value.running) {
             speaker.add("Camera disconnected.")
+        } else if (s != prev && s.startsWith("press the camera")) {
+            // First use with a BrainOS Cam: the camera only pairs after its button is pressed.
+            speaker.add("Press the camera's button to pair it with this phone.")
+        } else if (s != prev && s.startsWith("this camera is paired")) {
+            speaker.add("This camera is paired with another phone. Hold its button for ten seconds to reset it.")
         }
     }
 
@@ -187,6 +215,11 @@ class SightService : Service() {
             speaker.say("Speech recognition isn't available.")
             return
         }
+        if (!ears.onDevice && !settings.onlineSpeech) {
+            // Sight promises that nothing leaves the phone, so the online recognizer is never used silently.
+            speaker.say("This phone can't recognize speech by itself. To ask questions, allow online speech recognition in Sight's settings.")
+            return
+        }
         speaker.say("Ask.") {
             main.post {
                 SightHub.state.update { it.copy(status = "Listening") }
@@ -199,6 +232,31 @@ class SightService : Service() {
                         request(req)
                     }
                 }
+            }
+        }
+    }
+
+    /** Developer test: see [CameraLink.probeE12]. Results go to the log ("e12-probe" lines). */
+    private fun probeCamera() {
+        if (busy || (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0) return
+        val cam = camera
+        if (cam == null || !cam.isReady) {
+            speaker.say(if (cam == null) "Sight is off." else "The camera isn't connected.")
+            return
+        }
+        busy = true
+        SightHub.state.update { it.copy(busy = true, status = "Testing the camera") }
+        worker.execute {
+            val summary = try {
+                cam.probeE12 { line -> main.post { speaker.add(line) } }
+            } catch (t: Throwable) {
+                Log.w(LOG_TAG, "e12-probe failed " + t.javaClass.simpleName + ": " + t.message)
+                "Camera test failed."
+            }
+            Log.i(LOG_TAG, "e12-probe done")
+            main.post {
+                busy = false
+                SightHub.state.update { it.copy(busy = false, status = "Ready", lastSpoken = summary) }
             }
         }
     }
@@ -216,46 +274,120 @@ class SightService : Service() {
         ears.cancel()
         SightHub.state.update { it.copy(busy = true, status = "Looking") }
         speaker.say("Looking.")
+        val t0 = SystemClock.elapsedRealtime()
         worker.execute {
-            val reply = try {
-                work(cam, req)
+            // Everything is spoken the moment it's known: quick facts first, then the model's
+            // answer sentence by sentence while it is still being written.
+            val spoken = StringBuilder()
+            val timing = Timing(t0)
+            val say: (String) -> Unit = { line ->
+                if (timing.firstAnswer < 0) timing.firstAnswer = SystemClock.elapsedRealtime() - t0
+                spoken.append(line.trim()).append(' ')
+                main.post { speaker.add(line) }
+            }
+            try {
+                work(cam, req, say, timing)
             } catch (t: Throwable) {
                 Log.w(LOG_TAG, "request-failed " + t.javaClass.simpleName + ": " + t.message)
-                "Something went wrong."
+                say("Something went wrong.")
             }
+            timing.total = SystemClock.elapsedRealtime() - t0
+            Log.i(LOG_TAG, "timing ${timing.log()} bytes=${cam.lastBytes}")
             main.post {
                 busy = false
-                SightHub.state.update { it.copy(busy = false, status = "Ready", lastSpoken = reply) }
-                speaker.say(reply)
+                SightHub.state.update {
+                    it.copy(busy = false, status = "Ready", lastSpoken = spoken.toString().trim(), timing = timing.show())
+                }
             }
         }
     }
 
-    /** Runs on the worker thread. Returns what to say. */
-    private fun work(cam: CameraLink, req: Request): String {
-        val jpeg = cam.snap() ?: return "The camera didn't send a photo. Try again."
-        val bitmap = eyes.decode(jpeg) ?: return "The photo couldn't be opened."
-        SightHub.state.update { it.copy(photo = bitmap, status = if (req is Request.Read) "Reading" else "Thinking") }
-        val read = eyes.read(bitmap)
-        val dark = if (read.dark) "It's very dark. " else ""
+    /** Milliseconds from the request to each step, shown on screen and logged for testing. */
+    private class Timing(val t0: Long) {
+        var photo = -1L
+        var read = -1L
+        var firstAnswer = -1L
+        var total = -1L
+        fun log() = "photo=$photo read=$read first=$firstAnswer total=$total"
+        fun show(): String {
+            fun s(ms: Long) = String.format(java.util.Locale.US, "%.1f s", ms / 1000.0)
+            return listOfNotNull(
+                photo.takeIf { it >= 0 }?.let { "photo ${s(it)}" },
+                firstAnswer.takeIf { it >= 0 }?.let { "first words ${s(it)}" },
+                total.takeIf { it >= 0 }?.let { "done ${s(it)}" },
+            ).joinToString(" · ")
+        }
+    }
 
-        if (req is Request.Read) {
-            if (read.text.isNotBlank()) {
-                return listOfNotNull(read.hint, read.text).joinToString(" ")
+    /** Runs on the worker thread. Speaks through [say] as results come in. */
+    private fun work(cam: CameraLink, req: Request, say: (String) -> Unit, timing: Timing) {
+        // Three quick shots; the camera keeps the sharpest (least blurred) one.
+        cam.onNotice = say // e.g. "If the phone asks, tap Connect" while joining the headset's Wi-Fi
+        var jpeg = try {
+            cam.snap(burst = 3)
+        } finally {
+            cam.onNotice = null
+        }
+        if (jpeg == null) {
+            say("The camera didn't send a photo: " + cam.lastFailure.ifBlank { "unknown problem" } + ". Try again.")
+            return
+        }
+        var bitmap = eyes.decode(jpeg)
+        if (bitmap == null) {
+            // A photo that arrived damaged: quietly take another one before giving up.
+            Log.w(LOG_TAG, "photo-undecodable bytes=${jpeg.size}; retrying")
+            jpeg = cam.snap(burst = 3)
+            bitmap = jpeg?.let { eyes.decode(it) }
+        }
+        timing.photo = SystemClock.elapsedRealtime() - timing.t0
+        if (bitmap == null) {
+            say("The photo couldn't be opened.")
+            return
+        }
+        if (cam.lastNote.isNotBlank()) {
+            Log.w(LOG_TAG, "photo-note ${cam.lastNote}")
+            say("Only a small photo came through.")
+        }
+        Log.i(LOG_TAG, "photo-size ${bitmap.width}x${bitmap.height}")
+        SightHub.state.update { it.copy(photo = bitmap, status = if (req is Request.Read) "Reading" else "Thinking") }
+
+        if (req is Request.Color) {
+            say(eyes.colors(bitmap))
+            return
+        }
+
+        val read = eyes.read(bitmap)
+        timing.read = SystemClock.elapsedRealtime() - timing.t0
+        if (read.dark) say("It's very dark.")
+
+        when (req) {
+            is Request.Read -> {
+                if (read.text.isNotBlank()) {
+                    read.hint?.let(say)
+                    say(read.text)
+                    return
+                }
+                if (!eyes.modelInstalled) {
+                    say("I don't see any text.")
+                    return
+                }
+                say("No text.")
             }
-            if (!eyes.modelInstalled) return dark + "I don't see any text."
+            is Request.Describe -> if (read.text.isNotBlank()) say("There's text: " + firstWords(read.text) + ".")
+            else -> {}
         }
 
         if (!eyes.modelLoaded) {
             if (!eyes.modelInstalled) {
-                return if (read.text.isNotBlank()) {
-                    "Scene descriptions aren't set up yet. Here is the text I see. " + read.text
-                } else {
-                    dark + "Scene descriptions aren't set up yet, and I don't see any text."
-                }
+                if (read.text.isNotBlank() && req !is Request.Describe) say("Here is the text I see. " + read.text)
+                say("Scene descriptions aren't set up yet.")
+                return
             }
-            main.post { speaker.say("Starting the scene model. This takes a moment the first time.") }
-            eyes.loadModel()?.let { return it }
+            say("Starting the scene model. This takes a moment the first time.")
+            eyes.loadModel()?.let {
+                say(it)
+                return
+            }
             refreshModelState()
         }
 
@@ -263,8 +395,12 @@ class SightService : Service() {
             is Request.Question -> Prompts.question(req.text, read.text)
             else -> Prompts.describe(read.text)
         }
-        val answer = eyes.ask(bitmap, prompt) ?: return dark + "I couldn't describe that. Try again."
-        return if (req is Request.Read) "No text. $answer" else dark + answer
+        eyes.askStreaming(bitmap, prompt, say) ?: say("I couldn't describe that. Try again.")
+    }
+
+    private fun firstWords(text: String, n: Int = 8): String {
+        val words = text.lineSequence().firstOrNull { it.isNotBlank() }.orEmpty().trim().split(Regex("\\s+"))
+        return words.take(n).joinToString(" ") + if (words.size > n) "…" else ""
     }
 
     // ------------------------------------------------------------------ settings and model
@@ -371,14 +507,17 @@ class SightService : Service() {
     }
 
     companion object {
+        private const val WAKE_LIMIT_MS = 12 * 60 * 60_000L
         const val ACTION_START = "sight.START"
         const val ACTION_STOP = "sight.STOP"
         const val ACTION_READ = "sight.READ"
         const val ACTION_DESCRIBE = "sight.DESCRIBE"
         const val ACTION_ASK = "sight.ASK"
+        const val ACTION_COLOR = "sight.COLOR"
         const val ACTION_HUSH = "sight.HUSH"
         const val ACTION_SETTINGS = "sight.SETTINGS"
         const val ACTION_MODEL = "sight.MODEL"
+        const val ACTION_PROBE = "sight.PROBE"
         private const val CHANNEL = "sight"
         private const val NOTIFICATION_ID = 7
     }

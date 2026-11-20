@@ -92,6 +92,8 @@ private fun Screen() {
             need += Manifest.permission.ACCESS_FINE_LOCATION
         }
         if (Build.VERSION.SDK_INT >= 33) need += Manifest.permission.POST_NOTIFICATIONS
+        // Full-size photos from the E12 headset come over its own Wi-Fi.
+        if (Build.VERSION.SDK_INT >= 33) need += Manifest.permission.NEARBY_WIFI_DEVICES
         val missing = need.filter { ContextCompat.checkSelfPermission(ctx, it) != PackageManager.PERMISSION_GRANTED }
         if (missing.isEmpty()) SightHub.command(ctx, SightService.ACTION_START) else permissions.launch(missing.toTypedArray())
     }
@@ -115,7 +117,7 @@ private fun Screen() {
             modifier = Modifier.semantics { heading() },
         )
         Text(
-            "Reads text and describes what's in front of you. Everything stays on this phone.",
+            "Reads text and describes what's in front of you. Photos never leave this phone.",
             color = Ink.dim,
             fontSize = 16.sp,
         )
@@ -138,6 +140,7 @@ private fun Screen() {
                 SightHub.command(ctx, SightService.ACTION_DESCRIBE)
             }
             BigButton("Ask a question", enabled = !st.busy) { SightHub.command(ctx, SightService.ACTION_ASK) }
+            BigButton("What color is this?", enabled = !st.busy) { SightHub.command(ctx, SightService.ACTION_COLOR) }
             BigButton("Stop talking", primary = false) { SightHub.command(ctx, SightService.ACTION_HUSH) }
         }
 
@@ -145,6 +148,7 @@ private fun Screen() {
             Card {
                 Text("Last answer", color = Ink.dim, fontSize = 14.sp, modifier = Modifier.semantics { heading() })
                 Text(st.lastSpoken, color = Ink.text, fontSize = 18.sp, lineHeight = 25.sp)
+                if (st.timing.isNotBlank()) Text(st.timing, color = Ink.dim, fontSize = 14.sp)
             }
         }
 
@@ -162,8 +166,7 @@ private fun Screen() {
             Text(
                 "Headset button: press once to read, twice to describe. Press while it talks to stop.\n" +
                     "Earbud tap: ask a question. Tap while it talks to stop.\n" +
-                    "Earbud next track: describe. Previous track: read.\n" +
-                    "Hold the headset button for 2 seconds to turn the camera off.",
+                    "Earbud next track: describe. Previous track: read.",
                 color = Ink.dim,
                 fontSize = 16.sp,
                 lineHeight = 23.sp,
@@ -225,6 +228,48 @@ private fun Screen() {
                     },
                     modifier = Modifier.semantics { contentDescription = "Camera is mounted upside down" },
                 )
+            }
+            if (!st.speechOnDevice) {
+                var online by remember { mutableStateOf(settings.onlineSpeech) }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "Allow online speech recognition. This phone can't recognize speech by itself, so spoken " +
+                            "questions would go to its speech service. Photos still never leave the phone.",
+                        color = Ink.dim,
+                        fontSize = 16.sp,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Switch(
+                        checked = online,
+                        onCheckedChange = {
+                            online = it
+                            settings.onlineSpeech = it
+                        },
+                        modifier = Modifier.semantics { contentDescription = "Allow online speech recognition" },
+                    )
+                }
+            }
+            var addCamera by remember { mutableStateOf(false) }
+            OutlinedButton(
+                onClick = {
+                    // Sight only connects to cameras it has used before. This lets one new camera in.
+                    camlink.CameraLink.allowNewCamera(ctx)
+                    addCamera = true
+                },
+                enabled = !addCamera,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(if (addCamera) "Ready. Turn Sight off and on to add the camera." else "Add or replace camera", fontSize = 16.sp)
+            }
+        }
+        if ((ctx.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) Card {
+            Text("Developer", color = Ink.text, fontSize = 18.sp, modifier = Modifier.semantics { heading() })
+            OutlinedButton(
+                onClick = { SightHub.command(ctx, SightService.ACTION_PROBE) },
+                enabled = !st.busy,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Test headset camera modes", fontSize = 16.sp)
             }
         }
         Spacer(Modifier.height(24.dp))
@@ -291,6 +336,8 @@ private fun importModel(ctx: android.content.Context, uri: Uri) {
             tmp.delete()
             SightHub.state.update { it.copy(importing = -1, model = "Couldn't copy the model file") }
         }
-        SightHub.command(app, SightService.ACTION_MODEL)
+        // The copy takes minutes; if the app was left meanwhile, Android refuses to start the service
+        // from the background. The state above is already correct, so that's fine.
+        runCatching { SightHub.command(app, SightService.ACTION_MODEL) }
     }.start()
 }

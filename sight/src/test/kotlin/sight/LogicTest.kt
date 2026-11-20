@@ -59,4 +59,30 @@ class LogicTest {
         assertTrue(p.contains("not a mobility aid"))
         assertTrue(!Prompts.describe("").contains("text reader found"))
     }
+
+    @Test fun sentencesStreamAsTheyComplete() {
+        val s = SentenceStream()
+        assertTrue(s.feed("A wooden ").isEmpty())
+        assertEquals(listOf("A wooden table is ahead."), s.feed("table is ahead. A red"))
+        assertTrue(s.feed(" mug sits on Dr. Smith's").isEmpty())
+        assertEquals(listOf("A red mug sits on Dr. Smith's desk."), s.feed(" desk. "))
+        assertEquals("The door is left.", s.feed("The door is left.").let { s.finish() })
+        val cumulative = SentenceStream()
+        assertEquals(listOf("One."), cumulative.feed("One. Tw"))
+        assertEquals(listOf("Two."), cumulative.feed("One. Two. Th"))
+    }
+
+    @Test fun colorNamesAreHuman() {
+        assertEquals("navy blue", Colors.name(20, 30, 90))
+        assertEquals("red", Colors.name(200, 30, 30))
+        assertEquals("white", Colors.name(245, 245, 245))
+        assertEquals("black", Colors.name(10, 10, 12))
+        assertEquals("gray", Colors.name(128, 128, 128))
+        assertEquals("green", Colors.name(40, 160, 60))
+        assertEquals("orange", Colors.name(240, 140, 20))
+        assertEquals("brown", Colors.name(110, 70, 30))
+        assertEquals("Mostly navy blue, with some white.", Colors.sentence(listOf("navy blue" to 0.6f, "white" to 0.3f)))
+        assertEquals("Mostly red.", Colors.sentence(listOf("red" to 0.9f)))
+        assertEquals(Request.Color, Requests.parse("What color is this shirt"))
+    }
 }

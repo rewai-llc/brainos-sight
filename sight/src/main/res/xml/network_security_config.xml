@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Plain HTTP is allowed only to the E12 headset's own Wi-Fi addresses (it has no HTTPS). -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">192.168.169.1</domain>
+        <domain includeSubdomains="false">192.168.49.207</domain>
+    </domain-config>
+</network-security-config>
