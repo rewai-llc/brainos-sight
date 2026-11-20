@@ -1,7 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- No INTERNET permission: photos, speech and answers never leave the phone. -->
+    <!-- Sight never sends a photo or an answer anywhere. Spoken questions are recognized on the phone
+         where the phone can do that; otherwise only if the user allows online speech recognition.
+         The network permission exists only to download full-size photos from the E12 headset over the
+         headset's own local Wi-Fi. That link has no internet; the code refuses any address but the
+         headset's two (E12Wifi.get), and plain HTTP is allowed only to those two addresses
+         (res/xml/network_security_config.xml). ML Kit's usage reporting is removed below. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
@@ -15,6 +24,15 @@
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+
+    <!-- E12 camera headset: full-size photos are downloaded from the headset's own Wi-Fi.
+         Only the headset's local addresses are ever contacted (see res/xml/network_security_config.xml). -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation" />
 
     <queries>
         <intent>
@@ -31,8 +49,20 @@
         android:roundIcon="@mipmap/ic_launcher"
         android:label="BrainOS Sight"
         android:largeHeap="true"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:supportsRtl="true"
         android:theme="@style/Theme.Sight">
+
+        <!-- No usage reporting: remove the data-transport pieces ML Kit brings in, so nothing is sent to Google. -->
+        <service
+            android:name="com.google.android.datatransport.runtime.backends.TransportBackendDiscovery"
+            tools:node="remove" />
+        <service
+            android:name="com.google.android.datatransport.runtime.scheduling.jobscheduling.JobInfoSchedulerService"
+            tools:node="remove" />
+        <receiver
+            android:name="com.google.android.datatransport.runtime.scheduling.jobscheduling.AlarmManagerSchedulerBroadcastReceiver"
+            tools:node="remove" />
 
         <activity
             android:name="sight.MainActivity"

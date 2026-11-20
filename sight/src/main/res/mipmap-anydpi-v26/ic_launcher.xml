@@ -3,5 +3,3 @@
     <background android:drawable="@color/launcher_bg" />
     <foreground android:drawable="@drawable/ic_launcher_fg" />
 </adaptive-icon>
-
-

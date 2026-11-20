@@ -15,8 +15,8 @@ android {
         applicationId = "com.brainos.sight"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0-sight"
+        versionCode = 22
+        versionName = "0.5.0-sight"
     }
 
     buildTypes {
@@ -51,6 +51,7 @@ android {
 }
 
 dependencies {
+    implementation(project(":camera-link"))
     implementation(platform("androidx.compose:compose-bom:2024.12.01"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
@@ -66,4 +67,5 @@ dependencies {
     implementation("com.google.mediapipe:tasks-core:0.10.+")
 
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

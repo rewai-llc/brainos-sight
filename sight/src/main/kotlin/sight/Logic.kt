@@ -100,6 +100,7 @@ sealed class Request {
     data object Read : Request()
     data object Describe : Request()
     data class Question(val text: String) : Request()
+    data object Color : Request()
 }
 
 object Requests {
@@ -113,6 +114,11 @@ object Requests {
     fun parse(spoken: String): Request? {
         val s = spoken.trim().lowercase().removePrefix("brainos").trim(' ', ',', '.')
         if (s.isEmpty()) return null
+        if (s.startsWith("what color") || s.startsWith("what colour") || s.contains("what color is") ||
+            s.contains("what colour is")
+        ) {
+            return Request.Color
+        }
         if (readWords.any { s == it || s.startsWith("$it ") || s.startsWith("please $it") || s.startsWith("can you $it") }) {
             return Request.Read
         }
@@ -150,5 +156,106 @@ object Prompts {
             append("\n\nText that a text reader found in the photo (accurate, but may be partial):\n")
             append(t.take(1_500))
         }
+    }
+}
+
+/**
+ * Turns a model's streamed output into whole sentences, so speech can start as soon as the
+ * first sentence is written instead of waiting for the full answer.
+ * Handles listeners that send either new pieces or the whole text so far.
+ */
+class SentenceStream {
+    private val all = StringBuilder()
+    private var spokenUpTo = 0
+
+    /** Feed the next streamed piece. Returns any sentences that are now complete. */
+    fun feed(piece: String): List<String> {
+        if (piece.isEmpty()) return emptyList()
+        val sofar = all.toString()
+        if (piece.length > sofar.length && piece.startsWith(sofar) && sofar.isNotEmpty()) {
+            all.append(piece, sofar.length, piece.length) // cumulative listener
+        } else {
+            all.append(piece) // incremental listener
+        }
+        val out = mutableListOf<String>()
+        var i = spokenUpTo
+        while (i < all.length) {
+            val c = all[i]
+            val atEnd = i + 1 >= all.length
+            if ((c == '.' || c == '!' || c == '?' || c == '\n') && !atEnd && all[i + 1].isWhitespace()) {
+                val sentence = all.substring(spokenUpTo, i + 1).trim()
+                if (sentence.isNotEmpty() && !isAbbreviation(sentence)) {
+                    out.add(sentence)
+                    spokenUpTo = i + 1
+                }
+            }
+            i++
+        }
+        return out
+    }
+
+    /** Whatever is left once the model has finished. */
+    fun finish(): String? = all.substring(spokenUpTo).trim().ifEmpty { null }.also { spokenUpTo = all.length }
+
+    val text: String get() = all.toString().trim()
+
+    private fun isAbbreviation(s: String): Boolean {
+        val last = s.substringAfterLast(' ').lowercase()
+        return last in setOf("mr.", "mrs.", "ms.", "dr.", "st.", "no.", "e.g.", "i.e.", "vs.")
+    }
+}
+
+/** Plain-language color names, computed on the phone from pixels (no model needed). */
+object Colors {
+    /** Name for one color given as 0..255 RGB, e.g. "dark blue", "light gray", "orange". */
+    fun name(r: Int, g: Int, b: Int): String {
+        val max = maxOf(r, g, b) / 255f
+        val min = minOf(r, g, b) / 255f
+        val l = (max + min) / 2f
+        val d = max - min
+        val s = if (d == 0f) 0f else d / (1f - kotlin.math.abs(2f * l - 1f))
+        if (l < 0.12f) return "black"
+        if (l > 0.92f && s < 0.35f) return "white"
+        if (s < 0.15f) {
+            return when {
+                l < 0.35f -> "dark gray"
+                l > 0.7f -> "light gray"
+                else -> "gray"
+            }
+        }
+        val rf = r / 255f
+        val gf = g / 255f
+        val bf = b / 255f
+        var h = when (max) {
+            rf -> 60f * (((gf - bf) / d) % 6f)
+            gf -> 60f * (((bf - rf) / d) + 2f)
+            else -> 60f * (((rf - gf) / d) + 4f)
+        }
+        if (h < 0) h += 360f
+        val hue = when {
+            h < 15 || h >= 345 -> "red"
+            h < 40 -> if (l < 0.45f) "brown" else "orange"
+            h < 65 -> if (l < 0.4f) "olive" else "yellow"
+            h < 160 -> "green"
+            h < 195 -> "teal"
+            h < 250 -> "blue"
+            h < 290 -> "purple"
+            else -> "pink"
+        }
+        if (hue == "blue" && l < 0.3f) return "navy blue"
+        if (hue == "red" && l > 0.7f) return "pink"
+        return when {
+            l < 0.3f && hue != "brown" && hue != "olive" -> "dark $hue"
+            l > 0.72f && hue != "pink" -> "light $hue"
+            else -> hue
+        }
+    }
+
+    /** Sentence for the main colors, from names already counted by share of the area. */
+    fun sentence(shares: List<Pair<String, Float>>): String {
+        val top = shares.filter { it.second >= 0.12f }.take(2)
+        if (top.isEmpty()) return "I can't tell the color."
+        if (top.size == 1 || top[0].second >= 0.7f) return "Mostly ${top[0].first}."
+        return "Mostly ${top[0].first}, with some ${top[1].first}."
     }
 }

@@ -13,7 +13,9 @@ import com.google.mediapipe.tasks.genai.llminference.LlmInferenceSession
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import com.google.mediapipe.tasks.genai.llminference.ProgressListener
 import java.io.File
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /** Result of reading a photo with the on-device text recognizer. */
@@ -37,21 +39,27 @@ class Eyes(context: Context) {
     fun decode(jpeg: ByteArray): Bitmap? = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
 
     fun read(bitmap: Bitmap): ReadResult {
-        val text = try {
-            Tasks.await(recognizer.process(InputImage.fromBitmap(bitmap, 0)), 15, TimeUnit.SECONDS)
-        } catch (t: Throwable) {
-            Log.w(LOG_TAG, "ocr-failed " + t.javaClass.simpleName)
-            null
+        // The camera can sit at any angle on the headset, and people hold pages any which way:
+        // if nothing is found upright, try the photo turned a quarter, three quarters and half way.
+        for (rotation in intArrayOf(0, 90, 270, 180)) {
+            val text = try {
+                Tasks.await(recognizer.process(InputImage.fromBitmap(bitmap, rotation)), 15, TimeUnit.SECONDS)
+            } catch (t: Throwable) {
+                Log.w(LOG_TAG, "ocr-failed " + t.javaClass.simpleName)
+                null
+            }
+            val blocks = text?.textBlocks.orEmpty()
+            Log.i(LOG_TAG, "ocr rotation=$rotation blocks=${blocks.size} size=${bitmap.width}x${bitmap.height}")
+            if (blocks.isEmpty()) continue
+            // Boxes come back in the rotated frame, so reading order and framing hints still work.
+            val (w, h) = if (rotation == 90 || rotation == 270) bitmap.height to bitmap.width else bitmap.width to bitmap.height
+            val boxes = blocks.mapNotNull { b ->
+                val r = b.boundingBox ?: return@mapNotNull null
+                TextBox(b.text, r.left, r.top, r.right, r.bottom)
+            }
+            return ReadResult(Reading.text(boxes), Reading.framingHint(boxes, w, h), isDark(bitmap))
         }
-        val boxes = text?.textBlocks.orEmpty().mapNotNull { b ->
-            val r = b.boundingBox ?: return@mapNotNull null
-            TextBox(b.text, r.left, r.top, r.right, r.bottom)
-        }
-        return ReadResult(
-            text = Reading.text(boxes),
-            hint = Reading.framingHint(boxes, bitmap.width, bitmap.height),
-            dark = isDark(bitmap),
-        )
+        return ReadResult(text = "", hint = null, dark = isDark(bitmap))
     }
 
     /** Loads Gemma (a few seconds the first time). Returns an error message, or null when ready. */
@@ -96,6 +104,64 @@ class Eyes(context: Context) {
         }
     }
 
+    /**
+     * Asks Gemma about the photo and hands back each sentence as soon as it is written, so it
+     * can be spoken while the rest is still being generated. Returns the full answer, or null.
+     */
+    @Synchronized
+    fun askStreaming(bitmap: Bitmap, prompt: String, onSentence: (String) -> Unit): String? {
+        val model = llm ?: return null
+        val options = LlmInferenceSession.LlmInferenceSessionOptions.builder()
+            .setTopK(10)
+            .setTemperature(0.3f)
+            .setGraphOptions(GraphOptions.builder().setEnableVisionModality(true).build())
+            .build()
+        return try {
+            LlmInferenceSession.createFromOptions(model, options).use { session ->
+                session.addQueryChunk(prompt)
+                session.addImage(BitmapImageBuilder(scaled(bitmap, 768)).build())
+                val stream = SentenceStream()
+                val done = CountDownLatch(1)
+                session.generateResponseAsync(
+                    ProgressListener<String> { partial, finished ->
+                        stream.feed(partial ?: "").forEach(onSentence)
+                        if (finished) {
+                            stream.finish()?.let(onSentence)
+                            done.countDown()
+                        }
+                    },
+                )
+                if (!done.await(90, TimeUnit.SECONDS)) {
+                    runCatching { session.cancelGenerateResponseAsync() }
+                    Log.w(LOG_TAG, "gemma-timeout")
+                }
+                stream.text.ifEmpty { null }
+            }
+        } catch (t: Throwable) {
+            Log.w(LOG_TAG, "gemma-stream-failed " + t.javaClass.simpleName + ": " + t.message)
+            null
+        }
+    }
+
+    /** "Mostly navy blue, with some white." from the middle of the photo, where people point. */
+    fun colors(bitmap: Bitmap): String {
+        val w = bitmap.width
+        val h = bitmap.height
+        val center = Bitmap.createBitmap(bitmap, w / 4, h / 4, w / 2, h / 2)
+        val small = Bitmap.createScaledBitmap(center, 40, 30, true)
+        val counts = HashMap<String, Int>()
+        for (y in 0 until small.height) for (x in 0 until small.width) {
+            val c = small.getPixel(x, y)
+            val n = Colors.name(Color.red(c), Color.green(c), Color.blue(c))
+            counts[n] = (counts[n] ?: 0) + 1
+        }
+        val total = (small.width * small.height).toFloat()
+        val shares = counts.entries.sortedByDescending { it.value }.map { it.key to it.value / total }
+        if (center != bitmap) center.recycle()
+        small.recycle()
+        return Colors.sentence(shares)
+    }
+
     @Synchronized
     fun close() {
         runCatching { llm?.close() }
@@ -118,7 +184,9 @@ class Eyes(context: Context) {
             val c = s.getPixel(x, y)
             sum += (Color.red(c) * 299 + Color.green(c) * 587 + Color.blue(c) * 114) / 1000
         }
-        return sum / (s.width * s.height) < 35
+        val avg = sum / (s.width * s.height)
+        if (s != b) s.recycle()
+        return avg < 35
     }
 
     companion object {

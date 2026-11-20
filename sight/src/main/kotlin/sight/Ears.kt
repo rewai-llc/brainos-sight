@@ -10,19 +10,24 @@ import android.speech.SpeechRecognizer
 import android.util.Log
 
 /**
- * One spoken question, recognized on the phone when the device supports it
- * (Pixel phones do), otherwise by the system recognizer with offline preferred.
+ * One spoken question, recognized on the phone when the device supports it (Pixel phones do).
+ * Otherwise the only option is the system recognizer, which may send the audio to its online
+ * service even with "offline preferred"; [SightService] only uses that if the user has allowed it.
  * Must be used on the main thread.
  */
 class Ears(private val context: Context) {
     private var recognizer: SpeechRecognizer? = null
 
-    val available: Boolean get() = SpeechRecognizer.isRecognitionAvailable(context)
+    /** True when this phone can recognize speech entirely on the device (Android 12+, model installed). */
+    val onDevice: Boolean
+        get() = Build.VERSION.SDK_INT >= 31 && SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
+
+    /** Some recognizer exists, on the phone or through the system's (possibly online) speech service. */
+    val available: Boolean get() = onDevice || SpeechRecognizer.isRecognitionAvailable(context)
 
     fun listen(onResult: (String?) -> Unit) {
         cancel()
-        val onDevice = Build.VERSION.SDK_INT >= 31 && SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
-        val sr = if (onDevice) {
+        val sr = if (Build.VERSION.SDK_INT >= 31 && onDevice) {
             SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
         } else {
             SpeechRecognizer.createSpeechRecognizer(context)
